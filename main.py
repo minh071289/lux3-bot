@@ -1,10 +1,8 @@
 import json
+import os
 from pathlib import Path
 from argparse import Namespace
 
-from agent import Agent
-from agent.kit import from_json
-from agent.base import IS_KAGGLE
 from orbitwars import OrbitWarsAgent
 from orbitwars.types import normalize_observation
 
@@ -26,7 +24,7 @@ def _is_orbitwars_observation(obs):
 
 
 def _get_working_folder():
-    if IS_KAGGLE:
+    if os.environ.get("KAGGLE_KERNEL_RUN_TYPE") or os.path.exists("/kaggle_simulations"):
         return "/kaggle_simulations/agent/"
     return Path(__file__).parent
 
@@ -36,6 +34,8 @@ def agent_fn(observation, configurations):
     agent definition for kaggle submission.
     """
     global agent_dict
+    from agent import Agent
+    from agent.kit import from_json
 
     working_folder = _get_working_folder()
 
