@@ -1,5 +1,8 @@
 import os
 import json
+import glob
+import shutil
+import subprocess
 from pathlib import Path
 from dataclasses import dataclass
 from typing import Optional
@@ -39,8 +42,45 @@ def update_submission_names(submission_to_name):
     df.to_csv(SUBMISSIONS_PATH, index=False)
 
 
+def _download_replay_via_cli(episode_id: int) -> dict:
+    if shutil.which("kaggle") is None:
+        raise RuntimeError("Kaggle CLI is not available for replay fallback")
+
+    before = set(glob.glob(os.path.join(OUTPUT_DIR, "*.json")))
+    cmd = ["kaggle", "competitions", "replay", str(int(episode_id)), "-p", OUTPUT_DIR]
+    result = subprocess.run(cmd, check=True, capture_output=True, text=True)
+    after = set(glob.glob(os.path.join(OUTPUT_DIR, "*.json")))
+
+    candidates = sorted(after - before)
+    if not candidates:
+        direct_path = os.path.join(OUTPUT_DIR, f"{episode_id}.json")
+        if os.path.exists(direct_path):
+            candidates = [direct_path]
+        else:
+            candidates = sorted(glob.glob(os.path.join(OUTPUT_DIR, f"*{episode_id}*.json")))
+
+    if not candidates:
+        raise FileNotFoundError(
+            f"Kaggle CLI reported success but no replay JSON was found for episode {episode_id}. "
+            f"stdout={result.stdout!r} stderr={result.stderr!r}"
+        )
+
+    replay_path = max(candidates, key=os.path.getmtime)
+    with open(replay_path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def _fetch_replay_json(episode_id: int) -> dict:
+    response = requests.post(GET_URL, json={"episodeId": int(episode_id)}, timeout=60)
+    response.raise_for_status()
+    try:
+        return response.json()
+    except requests.exceptions.JSONDecodeError:
+        return _download_replay_via_cli(episode_id)
+
+
 def get_episode(episode_id, games_df=None):
-    replay = requests.post(GET_URL, json={"episodeId": int(episode_id)}).json()
+    replay = _fetch_replay_json(episode_id)
     assert episode_id == replay["info"]["EpisodeId"]
     normalized = normalize_kaggle_replay(replay)
     submissions = get_submission_ids(episode_id, games_df)
