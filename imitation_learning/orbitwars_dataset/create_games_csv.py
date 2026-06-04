@@ -1,3 +1,4 @@
+import os
 from pathlib import Path
 import datetime
 import collections
@@ -6,7 +7,30 @@ import polars as pl
 import tyro
 from dataclasses import dataclass
 
-META_DIR = Path("../input/meta-kaggle/")
+
+def get_meta_dir() -> Path:
+    candidates = []
+
+    env_path = os.environ.get("META_KAGGLE_DIR")
+    if env_path:
+        candidates.append(Path(env_path))
+
+    candidates.extend(
+        [
+            Path("/kaggle/input/meta-kaggle"),
+            Path(__file__).resolve().parents[3] / "input" / "meta-kaggle",
+            Path("../input/meta-kaggle"),
+        ]
+    )
+
+    for candidate in candidates:
+        if (candidate / "Episodes.csv").exists():
+            return candidate
+
+    raise FileNotFoundError(
+        "Could not find Meta Kaggle dataset. Expected Episodes.csv in one of: "
+        + ", ".join(str(path) for path in candidates)
+    )
 
 
 @dataclass
@@ -17,7 +41,9 @@ class Args:
 
 
 def main(args: Args):
-    episodes_df = pl.scan_csv(META_DIR / "Episodes.csv")
+    meta_dir = get_meta_dir()
+
+    episodes_df = pl.scan_csv(meta_dir / "Episodes.csv")
     episodes_df = (
         episodes_df.filter(pl.col("CompetitionId") == args.competition_id)
         .with_columns(
@@ -32,7 +58,7 @@ def main(args: Args):
     episodes_df = episodes_df.filter(pl.col("CreateTime") > min_dt)
 
     agents_df = pl.scan_csv(
-        META_DIR / "EpisodeAgents.csv",
+        meta_dir / "EpisodeAgents.csv",
         schema_overrides={
             "Reward": pl.Float32,
             "UpdatedConfidence": pl.Float32,
