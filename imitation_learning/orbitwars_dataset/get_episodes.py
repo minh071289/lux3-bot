@@ -71,11 +71,11 @@ def _download_replay_via_cli(episode_id: int) -> dict:
 
 
 def _fetch_replay_json(episode_id: int) -> dict:
-    response = requests.post(GET_URL, json={"episodeId": int(episode_id)}, timeout=60)
-    response.raise_for_status()
     try:
+        response = requests.post(GET_URL, json={"episodeId": int(episode_id)}, timeout=60)
+        response.raise_for_status()
         return response.json()
-    except requests.exceptions.JSONDecodeError:
+    except (requests.exceptions.RequestException, requests.exceptions.JSONDecodeError):
         return _download_replay_via_cli(episode_id)
 
 
