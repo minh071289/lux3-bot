@@ -1,35 +1,142 @@
 from __future__ import annotations
 
 import math
+import os
 from pathlib import Path
 from typing import Any
 
 import torch
 
 from .features import NUM_SHIP_BINS, featurize_observation
-from .geometry import bin_to_ship_count
+from .geometry import bin_to_ship_count, distance
 from .model import OrbitWarsGraphPolicy
-from .types import normalize_observation
+from .types import Planet, normalize_observation
+
+
+def _coerce_bool(value: Any, default: bool) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    value = str(value).strip().lower()
+    if value in {"1", "true", "yes", "on"}:
+        return True
+    if value in {"0", "false", "no", "off"}:
+        return False
+    return default
+
+
+def resolve_weights_path(weights_path: str | Path | None) -> Path | None:
+    if weights_path is None:
+        candidates = []
+    else:
+        candidates = [Path(weights_path)]
+
+    candidates.extend(
+        [
+            Path("/kaggle_simulations/agent/imitation_learning/weights/orbitwars_graph_policy.pth"),
+            Path(__file__).resolve().parents[1] / "imitation_learning" / "weights" / "orbitwars_graph_policy.pth",
+            Path.cwd() / "imitation_learning" / "weights" / "orbitwars_graph_policy.pth",
+        ]
+    )
+
+    seen = set()
+    for candidate in candidates:
+        candidate = candidate.resolve() if candidate.is_absolute() else candidate
+        key = str(candidate)
+        if key in seen:
+            continue
+        seen.add(key)
+        if candidate.exists():
+            return candidate
+    return None
+
+
+def choose_heuristic_actions(obs) -> list[list[float]]:
+    my_planets = [planet for planet in obs.planets if planet.owner == obs.player and planet.ships > 1]
+    targets = [planet for planet in obs.planets if planet.owner != obs.player]
+    if not my_planets or not targets:
+        return []
+
+    actions = []
+    targeted_ids = set()
+
+    # Prefer targets that are productive, weakly defended, and nearby.
+    def target_score(source: Planet, target: Planet) -> tuple[float, float]:
+        dist = distance(source.x, source.y, target.x, target.y)
+        value = target.production * 12.0 - target.ships - dist * 0.35
+        if target.owner < 0:
+            value += 6.0
+        return (-value, dist)
+
+    for source in sorted(my_planets, key=lambda planet: (-planet.ships, -planet.production)):
+        available = source.ships
+        if available <= 1:
+            continue
+
+        remaining_targets = [target for target in targets if target.id not in targeted_ids]
+        if not remaining_targets:
+            remaining_targets = targets
+
+        target = min(remaining_targets, key=lambda candidate: target_score(source, candidate))
+        required = max(1, target.ships + 1)
+
+        # If we cannot cleanly capture, still send pressure from very large planets.
+        if available <= required:
+            if available < 24:
+                continue
+            send = max(1, int(round(available * 0.5)))
+        else:
+            send = required
+            if target.owner >= 0:
+                send = max(send, int(round(available * 0.35)))
+            else:
+                send = max(send, int(round(available * 0.2)))
+
+        send = min(available - 1, send)
+        if send <= 0:
+            continue
+
+        angle = math.atan2(target.y - source.y, target.x - source.x)
+        if not math.isfinite(angle):
+            continue
+
+        actions.append([int(source.id), float(angle), int(send)])
+        targeted_ids.add(target.id)
+
+    return actions
 
 
 class OrbitWarsAgent:
-    def __init__(self, weights_path: str | Path | None = None, device: str = "cpu") -> None:
+    def __init__(
+        self,
+        weights_path: str | Path | None = None,
+        device: str = "cpu",
+        use_heuristic_fallback: bool = True,
+    ) -> None:
         self.device = torch.device(device)
         self.model = OrbitWarsGraphPolicy().to(self.device)
         self.model.eval()
         self.ready = False
+        self.weights_path = resolve_weights_path(weights_path)
+        self.use_heuristic_fallback = use_heuristic_fallback
 
-        if weights_path is not None:
-            weights_path = Path(weights_path)
-            if weights_path.exists():
-                checkpoint = torch.load(weights_path, map_location=self.device)
-                state_dict = checkpoint.get("model_state_dict", checkpoint)
-                self.model.load_state_dict(state_dict)
-                self.ready = True
+        if self.weights_path is not None:
+            checkpoint = torch.load(self.weights_path, map_location=self.device)
+            state_dict = checkpoint.get("model_state_dict", checkpoint)
+            self.model.load_state_dict(state_dict)
+            self.ready = True
+
+    def set_use_heuristic_fallback(self, value: bool) -> None:
+        self.use_heuristic_fallback = bool(value)
 
     def act(self, observation: Any) -> list[list[float]]:
         obs = normalize_observation(observation)
         if not self.ready:
+            if self.use_heuristic_fallback:
+                return choose_heuristic_actions(obs)
             return []
 
         encoded = featurize_observation(obs)
@@ -49,6 +156,9 @@ class OrbitWarsAgent:
             target_logits.squeeze(0).cpu(),
             ship_logits.squeeze(0).cpu(),
         )
+        if not actions and self.use_heuristic_fallback:
+            return choose_heuristic_actions(obs)
+        return actions
 
 
 def decode_actions_from_outputs(
@@ -59,7 +169,7 @@ def decode_actions_from_outputs(
     launch_logits,
     target_logits,
     ship_logits,
-    launch_threshold: float = 0.5,
+    launch_threshold: float = 0.35,
 ) -> list[list[float]]:
     planets = {planet.id: planet for planet in obs.planets}
     actions = []
@@ -101,10 +211,19 @@ _AGENT: OrbitWarsAgent | None = None
 
 def agent(obs, config=None):
     global _AGENT
+    use_heuristic_fallback = True
+    weights_path = None
+    if config is not None and isinstance(config, dict):
+        weights_path = config.get("weights_path")
+        use_heuristic_fallback = _coerce_bool(
+            config.get("orbitwars_use_heuristic_fallback"),
+            True,
+        )
     if _AGENT is None:
-        if config is not None and isinstance(config, dict):
-            weights_path = config.get("weights_path")
-        else:
-            weights_path = None
-        _AGENT = OrbitWarsAgent(weights_path=weights_path)
+        _AGENT = OrbitWarsAgent(
+            weights_path=weights_path,
+            use_heuristic_fallback=use_heuristic_fallback,
+        )
+    else:
+        _AGENT.set_use_heuristic_fallback(use_heuristic_fallback)
     return _AGENT.act(obs)
