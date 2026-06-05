@@ -8,7 +8,7 @@ from typing import Any
 import torch
 
 from .features import NUM_SHIP_BINS, featurize_observation
-from .geometry import bin_to_ship_count, distance
+from .geometry import SHIP_FRACTIONS, bin_to_ship_count, distance
 from .model import OrbitWarsGraphPolicy
 from .types import Planet, normalize_observation
 
@@ -120,6 +120,7 @@ class OrbitWarsAgent:
         weights_path: str | Path | None = None,
         device: str = "cpu",
         use_heuristic_fallback: bool = True,
+        launch_threshold: float = 0.35,
     ) -> None:
         self.device = torch.device(device)
         self.model = OrbitWarsGraphPolicy().to(self.device)
@@ -127,6 +128,7 @@ class OrbitWarsAgent:
         self.ready = False
         self.weights_path = resolve_weights_path(weights_path)
         self.use_heuristic_fallback = use_heuristic_fallback
+        self.launch_threshold = float(launch_threshold)
 
         if self.weights_path is not None:
             checkpoint = torch.load(self.weights_path, map_location=self.device)
@@ -136,6 +138,9 @@ class OrbitWarsAgent:
 
     def set_use_heuristic_fallback(self, value: bool) -> None:
         self.use_heuristic_fallback = bool(value)
+
+    def set_launch_threshold(self, value: float) -> None:
+        self.launch_threshold = float(value)
 
     def act(self, observation: Any) -> list[list[float]]:
         obs = normalize_observation(observation)
@@ -152,7 +157,7 @@ class OrbitWarsAgent:
                 torch.from_numpy(encoded.pair_features).unsqueeze(0).to(self.device),
                 torch.from_numpy(encoded.planet_mask).unsqueeze(0).to(self.device),
             )
-        return decode_actions_from_outputs(
+        actions = decode_actions_from_outputs(
             obs,
             encoded.planet_ids,
             encoded.planet_mask,
@@ -160,6 +165,7 @@ class OrbitWarsAgent:
             launch_logits.squeeze(0).cpu(),
             target_logits.squeeze(0).cpu(),
             ship_logits.squeeze(0).cpu(),
+            launch_threshold=self.launch_threshold,
         )
         if not actions and self.use_heuristic_fallback:
             return choose_heuristic_actions(obs)
@@ -218,19 +224,24 @@ def agent(obs, config=None):
     global _AGENT
     use_heuristic_fallback = True
     weights_path = None
+    launch_threshold = 0.35
     if config is not None and isinstance(config, dict):
         weights_path = config.get("weights_path")
         use_heuristic_fallback = _coerce_bool(
             config.get("orbitwars_use_heuristic_fallback"),
             True,
         )
+        if config.get("orbitwars_launch_threshold") is not None:
+            launch_threshold = float(config.get("orbitwars_launch_threshold"))
     if _AGENT is None:
         _AGENT = OrbitWarsAgent(
             weights_path=weights_path,
             use_heuristic_fallback=use_heuristic_fallback,
+            launch_threshold=launch_threshold,
         )
     else:
         _AGENT.set_use_heuristic_fallback(use_heuristic_fallback)
+        _AGENT.set_launch_threshold(launch_threshold)
     return _AGENT.act(obs)
 
 
@@ -238,11 +249,13 @@ def debug_policy_outputs(
     observation: Any,
     weights_path: str | Path | None = None,
     use_heuristic_fallback: bool = False,
+    launch_threshold: float = 0.35,
 ) -> dict[str, Any]:
     obs = normalize_observation(observation)
     agent = OrbitWarsAgent(
         weights_path=weights_path,
         use_heuristic_fallback=use_heuristic_fallback,
+        launch_threshold=launch_threshold,
     )
 
     info: dict[str, Any] = {
@@ -254,6 +267,7 @@ def debug_policy_outputs(
         "num_fleets": len(obs.fleets),
         "num_owned_planets": sum(1 for planet in obs.planets if planet.owner == obs.player),
         "heuristic_fallback_enabled": use_heuristic_fallback,
+        "launch_threshold": launch_threshold,
         "heuristic_actions": choose_heuristic_actions(obs),
     }
 
@@ -284,6 +298,7 @@ def debug_policy_outputs(
         launch_logits,
         target_logits,
         ship_logits,
+        launch_threshold=launch_threshold,
     )
     info["decoded_actions"] = decoded_actions
 
@@ -310,7 +325,7 @@ def debug_policy_outputs(
         best_ship_count = bin_to_ship_count(source.ships, best_ship_bin)
 
         decode_blockers = []
-        if launch_prob < 0.35:
+        if launch_prob < launch_threshold:
             decode_blockers.append("launch_below_threshold")
         if best_target_id is None or best_target_id < 0:
             decode_blockers.append("invalid_target")

@@ -100,7 +100,7 @@ def masked_mean(loss, mask):
     return loss.sum() / denom
 
 
-def compute_losses(model, batch, device):
+def compute_losses(model, batch, device, launch_pos_weight: float = 1.0):
     (
         global_features,
         planet_features,
@@ -134,6 +134,7 @@ def compute_losses(model, batch, device):
         launch_logits,
         launch_targets,
         reduction="none",
+        pos_weight=torch.tensor(launch_pos_weight, device=device),
     )
     launch_loss = masked_mean(launch_loss, owned_mask.float())
 
@@ -153,7 +154,7 @@ def compute_losses(model, batch, device):
     return total_loss, launch_logits, target_logits, ship_logits, owned_mask, target_mask, ship_mask
 
 
-def evaluate(model, dataloader, device):
+def evaluate(model, dataloader, device, launch_pos_weight: float = 1.0):
     model.eval()
     total_loss = 0.0
     launch_correct = 0
@@ -165,7 +166,7 @@ def evaluate(model, dataloader, device):
     with torch.no_grad():
         for batch in dataloader:
             loss, launch_logits, target_logits, ship_logits, owned_mask, target_mask, ship_mask = compute_losses(
-                model, batch, device
+                model, batch, device, launch_pos_weight=launch_pos_weight
             )
             total_loss += float(loss.item()) * len(batch[0])
 
@@ -206,7 +207,15 @@ def evaluate(model, dataloader, device):
     }
 
 
-def train_model(model, train_episodes, val_episodes, num_epochs=20, batch_size=8, lr=1e-3):
+def train_model(
+    model,
+    train_episodes,
+    val_episodes,
+    num_epochs=20,
+    batch_size=8,
+    lr=1e-3,
+    launch_pos_weight: float = 8.0,
+):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
@@ -219,19 +228,30 @@ def train_model(model, train_episodes, val_episodes, num_epochs=20, batch_size=8
         model.train()
         progress = tqdm(train_loader, leave=False)
         for batch in progress:
-            loss, *_ = compute_losses(model, batch, device)
+            loss, *_ = compute_losses(
+                model,
+                batch,
+                device,
+                launch_pos_weight=launch_pos_weight,
+            )
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
             progress.set_description(f"epoch {epoch + 1} loss {loss.item():.4f}")
 
-        metrics = evaluate(model, val_loader, device)
+        metrics = evaluate(
+            model,
+            val_loader,
+            device,
+            launch_pos_weight=launch_pos_weight,
+        )
         print(
             f"Epoch {epoch + 1}/{num_epochs} | "
             f"val_loss={metrics['loss']:.4f} "
             f"launch_acc={metrics['launch_acc']:.4f} "
             f"target_acc={metrics['target_acc']:.4f} "
-            f"ship_acc={metrics['ship_acc']:.4f}"
+            f"ship_acc={metrics['ship_acc']:.4f} "
+            f"launch_pos_weight={launch_pos_weight:.2f}"
         )
         if metrics["loss"] < best_loss:
             torch.save(
@@ -255,6 +275,7 @@ class Args:
     num_epochs: int = 20
     batch_size: int = 8
     lr: float = 1e-3
+    launch_pos_weight: float = 8.0
 
 
 def main(args: Args):
@@ -273,6 +294,7 @@ def main(args: Args):
         num_epochs=args.num_epochs,
         batch_size=args.batch_size,
         lr=args.lr,
+        launch_pos_weight=args.launch_pos_weight,
     )
 
 

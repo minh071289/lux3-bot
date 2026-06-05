@@ -73,11 +73,14 @@ def agent_fn(observation, configurations):
 def agent(observation, configuration=None):
     global orbitwars_agent
     use_heuristic_fallback = True
+    launch_threshold = 0.35
     if isinstance(configuration, dict):
         use_heuristic_fallback = _coerce_bool(
             configuration.get("orbitwars_use_heuristic_fallback"),
             True,
         )
+        if configuration.get("orbitwars_launch_threshold") is not None:
+            launch_threshold = float(configuration.get("orbitwars_launch_threshold"))
 
     if orbitwars_agent is None:
         working_folder = _get_working_folder()
@@ -85,9 +88,11 @@ def agent(observation, configuration=None):
         orbitwars_agent = OrbitWarsAgent(
             weights_path=weights_path,
             use_heuristic_fallback=use_heuristic_fallback,
+            launch_threshold=launch_threshold,
         )
     else:
         orbitwars_agent.set_use_heuristic_fallback(use_heuristic_fallback)
+        orbitwars_agent.set_launch_threshold(launch_threshold)
 
     obs = normalize_observation(observation)
     return orbitwars_agent.act(obs)
