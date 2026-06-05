@@ -232,3 +232,110 @@ def agent(obs, config=None):
     else:
         _AGENT.set_use_heuristic_fallback(use_heuristic_fallback)
     return _AGENT.act(obs)
+
+
+def debug_policy_outputs(
+    observation: Any,
+    weights_path: str | Path | None = None,
+    use_heuristic_fallback: bool = False,
+) -> dict[str, Any]:
+    obs = normalize_observation(observation)
+    agent = OrbitWarsAgent(
+        weights_path=weights_path,
+        use_heuristic_fallback=use_heuristic_fallback,
+    )
+
+    info: dict[str, Any] = {
+        "ready": agent.ready,
+        "resolved_weights_path": str(agent.weights_path) if agent.weights_path is not None else None,
+        "player": obs.player,
+        "step": obs.step,
+        "num_planets": len(obs.planets),
+        "num_fleets": len(obs.fleets),
+        "num_owned_planets": sum(1 for planet in obs.planets if planet.owner == obs.player),
+        "heuristic_fallback_enabled": use_heuristic_fallback,
+        "heuristic_actions": choose_heuristic_actions(obs),
+    }
+
+    if not agent.ready:
+        info["decoded_actions"] = []
+        info["owned_planet_debug"] = []
+        return info
+
+    encoded = featurize_observation(obs)
+    with torch.no_grad():
+        launch_logits, target_logits, ship_logits = agent.model(
+            torch.from_numpy(encoded.global_features).unsqueeze(0).to(agent.device),
+            torch.from_numpy(encoded.planet_features).unsqueeze(0).to(agent.device),
+            torch.from_numpy(encoded.pair_features).unsqueeze(0).to(agent.device),
+            torch.from_numpy(encoded.planet_mask).unsqueeze(0).to(agent.device),
+        )
+
+    launch_logits = launch_logits.squeeze(0).cpu()
+    target_logits = target_logits.squeeze(0).cpu()
+    ship_logits = ship_logits.squeeze(0).cpu()
+    launch_scores = torch.sigmoid(launch_logits)
+
+    decoded_actions = decode_actions_from_outputs(
+        obs,
+        encoded.planet_ids,
+        encoded.planet_mask,
+        encoded.owned_planet_mask,
+        launch_logits,
+        target_logits,
+        ship_logits,
+    )
+    info["decoded_actions"] = decoded_actions
+
+    planets = {planet.id: planet for planet in obs.planets}
+    owned_planet_debug = []
+    for idx, source_id in enumerate(encoded.planet_ids.tolist()):
+        if source_id < 0 or encoded.planet_mask[idx] <= 0 or encoded.owned_planet_mask[idx] <= 0:
+            continue
+
+        source = planets.get(source_id)
+        if source is None:
+            continue
+
+        launch_prob = float(launch_scores[idx].item())
+        best_target_idx = int(torch.argmax(target_logits[idx]).item())
+        best_target_id = None
+        best_target_logit = None
+        if 0 <= best_target_idx < len(encoded.planet_ids):
+            best_target_id = int(encoded.planet_ids[best_target_idx])
+            best_target_logit = float(target_logits[idx, best_target_idx].item())
+
+        best_ship_bin = int(torch.argmax(ship_logits[idx]).item())
+        best_ship_bin = max(0, min(best_ship_bin, NUM_SHIP_BINS - 1))
+        best_ship_count = bin_to_ship_count(source.ships, best_ship_bin)
+
+        decode_blockers = []
+        if launch_prob < 0.35:
+            decode_blockers.append("launch_below_threshold")
+        if best_target_id is None or best_target_id < 0:
+            decode_blockers.append("invalid_target")
+        elif best_target_id == source_id:
+            decode_blockers.append("self_target")
+        if best_ship_count <= 0:
+            decode_blockers.append("ship_count_zero")
+
+        owned_planet_debug.append(
+            {
+                "planet_id": int(source.id),
+                "ships": int(source.ships),
+                "production": int(source.production),
+                "launch_prob": launch_prob,
+                "launch_logit": float(launch_logits[idx].item()),
+                "best_target_idx": best_target_idx,
+                "best_target_id": best_target_id,
+                "best_target_logit": best_target_logit,
+                "best_ship_bin": best_ship_bin,
+                "best_ship_fraction": SHIP_FRACTIONS[best_ship_bin],
+                "best_ship_count": best_ship_count,
+                "decode_blockers": decode_blockers,
+            }
+        )
+
+    owned_planet_debug.sort(key=lambda row: (-row["launch_prob"], -row["ships"], row["planet_id"]))
+    info["owned_planet_debug"] = owned_planet_debug
+    return info
