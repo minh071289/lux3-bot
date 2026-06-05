@@ -80,20 +80,25 @@ def choose_heuristic_actions(obs) -> list[list[float]]:
         if not remaining_targets:
             remaining_targets = targets
 
-        target = min(remaining_targets, key=lambda candidate: target_score(source, candidate))
-        required = max(1, target.ships + 1)
+        ordered_targets = sorted(remaining_targets, key=lambda candidate: target_score(source, candidate))
+        target = ordered_targets[0]
+        capturable = [candidate for candidate in ordered_targets if available > candidate.ships]
+        if capturable:
+            target = capturable[0]
 
-        # If we cannot cleanly capture, still send pressure from very large planets.
-        if available <= required:
-            if available < 24:
-                continue
-            send = max(1, int(round(available * 0.5)))
-        else:
+        required = max(1, target.ships + 1)
+        if available > required:
             send = required
             if target.owner >= 0:
                 send = max(send, int(round(available * 0.35)))
             else:
                 send = max(send, int(round(available * 0.2)))
+        else:
+            # Stay active even before we can cleanly capture a strong target.
+            if target.owner >= 0:
+                send = max(1, int(round(available * 0.6)))
+            else:
+                send = max(1, int(round(available * 0.5)))
 
         send = min(available - 1, send)
         if send <= 0:
